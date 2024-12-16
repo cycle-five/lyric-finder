@@ -12,6 +12,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Releases
 
 ```bash
-git commit -S -am "chores: release vX.X.X"
-cargo release --execute
+cargo bump
+git commit -S -am "chore: release vX.X.X"
+cargo release --sign-tag --sign-commit --execute
 ```

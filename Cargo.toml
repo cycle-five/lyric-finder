@@ -1,11 +1,14 @@
 [package]
 name = "lyric_finder"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"
 description = "A lyric finder library"
-authors = ["Thang Pham <phamducthang1234@gmail.com>"]
-repository = "https://github.com/aome510/spotify-player/tree/master/lyric_finder"
+authors = [
+  "Thang Pham <phamducthang1234@gmail.com>",
+  "Cycle Five <cycle.five@proton.me>",
+]
+repository = "https://github.com/cycle-five/lyric-finder"
 keywords = ["lyric", "song", "track"]
 
 [features]
@@ -14,16 +17,16 @@ rustls-tls = ["reqwest/rustls-tls"]
 native-tls = ["reqwest/native-tls"]
 
 [dependencies]
-reqwest = { version = "0.12.9", features = ["json"], default-features = false }
-anyhow = "1.0.93"
-serde = { version = "1.0.214", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"], default-features = false }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 html5ever = "=0.27.0"
-markup5ever_rcdom = "0.3.0"
-log = "0.4.21"
+markup5ever_rcdom = "0.3"
+log = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1.41.1", features = ["rt", "rt-multi-thread", "macros"] }
-env_logger = { version = "0.11.3", default-features = false }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros"] }
+env_logger = { version = "0.11", default-features = false }
 
 [[example]]
 name = "lyric-finder"

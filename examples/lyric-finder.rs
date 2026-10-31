@@ -1,5 +1,3 @@
-extern crate lyric_finder;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();

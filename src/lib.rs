@@ -1,8 +1,8 @@
-//! # lyric_finder
+//! # `lyric_finder`
 //!
 //! This crate provides a [`Client`] struct for retrieving a song's lyric.
 //!
-//! It ultilizes the [Genius](https://genius.com) website and its APIs to get lyric data.
+//! It utilizes the [Genius](https://genius.com) website and its APIs to get lyric data.
 //!
 //! ## Example
 //!
@@ -10,7 +10,7 @@
 //! # use anyhow::Result;
 //! #
 //! # async fn run() -> Result<()> {
-//! let client =  lyric_finder::Client::new();
+//! let client = lyric_finder::Client::new();
 //! let result = client.get_lyric("shape of you").await?;
 //! match result {
 //!     lyric_finder::LyricResult::Some {
@@ -28,7 +28,21 @@
 //! # }
 //! ```
 
+use std::time::Duration;
+
 const SEARCH_BASE_URL: &str = "https://genius.com/api/search";
+
+/// Host we are willing to fetch lyric pages from (and follow redirects to), subdomains included.
+const ALLOWED_HOST: &str = "genius.com";
+
+/// Upper bound on a search API response body.
+const MAX_SEARCH_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on a lyric page body. Genius pages are typically well under 2 MiB.
+const MAX_LYRIC_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REDIRECTS: usize = 5;
 
 pub struct Client {
     http: reqwest::Client,
@@ -45,14 +59,37 @@ pub enum LyricResult {
 }
 
 impl Client {
+    /// Construct a client with a hardened default HTTP client: HTTPS only,
+    /// connect and request timeouts, and redirects restricted to `genius.com`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TLS backend cannot be initialized, the same condition under
+    /// which `reqwest::Client::new()` panics.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::new(),
-        }
+        let http = reqwest::Client::builder()
+            .https_only(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_REDIRECTS {
+                    attempt.error("too many redirects")
+                } else if is_allowed_url(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()
+            .expect("failed to build HTTP client (TLS backend initialization failed)");
+        Self { http }
     }
 
-    /// Construct a client reusing an existing http client
+    /// Construct a client reusing an existing http client.
+    ///
+    /// The caller is responsible for that client's timeouts and redirect policy.
+    /// Lyric page URLs are still validated to be `https://genius.com/...` before fetching.
     #[must_use]
     pub fn from_http_client(http: &reqwest::Client) -> Self {
         Self { http: http.clone() }
@@ -64,20 +101,27 @@ impl Client {
 
         log::debug!("search songs: query={query}");
 
-        let body = self
+        let response = self
             .http
-            .get(format!("{SEARCH_BASE_URL}?q={query}"))
+            .get(SEARCH_BASE_URL)
+            .query(&[("q", query.as_str())])
             .send()
-            .await?
-            .json::<search::Body>()
             .await?;
+        let status = response.status();
+        let bytes = read_body_capped(response, MAX_SEARCH_BODY_BYTES).await?;
+
+        let body: search::Body = match serde_json::from_slice(&bytes) {
+            Ok(body) => body,
+            Err(err) if !status.is_success() => {
+                anyhow::bail!("search request failed with status code: {status} ({err})")
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         if body.meta.status != 200 {
-            let message = if let Some(m) = body.meta.message {
-                m
-            } else {
+            let message = body.meta.message.unwrap_or_else(|| {
                 format!("request failed with status code: {}", body.meta.status)
-            };
+            });
             anyhow::bail!(message);
         }
 
@@ -94,10 +138,21 @@ impl Client {
     }
 
     /// Retrieve a song's lyric from a "genius.com" `url`.
+    ///
+    /// Returns an error if `url` is not an `https://genius.com/...` URL.
     pub async fn retrieve_lyric(&self, url: &str) -> anyhow::Result<String> {
-        let html = self.http.get(url).send().await?.text().await?;
-        log::debug!("retrieve lyric from url={url}: html={html}");
-        let lyric = parse::parse(&html)?;
+        let parsed = reqwest::Url::parse(url)?;
+        anyhow::ensure!(
+            is_allowed_url(&parsed),
+            "refusing to fetch lyric from non-genius.com URL: {url}"
+        );
+
+        let response = self.http.get(parsed).send().await?.error_for_status()?;
+        let bytes = read_body_capped(response, MAX_LYRIC_PAGE_BYTES).await?;
+        let html = String::from_utf8_lossy(&bytes);
+        log::trace!("retrieved lyric page from url={url} ({} bytes)", html.len());
+
+        let lyric = parse::parse(&html);
         Ok(lyric.trim().to_string())
     }
 
@@ -118,19 +173,17 @@ impl Client {
         let results = self.search_songs(query).await?;
 
         // Filter to find the first result where the artist names do not contain 'Genius'
-        let result = results
+        // (Genius-authored translation/romanization pages).
+        let Some(result) = results
             .into_iter()
-            .find(|result| !result.artist_names.contains("Genius"));
-
-        // If no valid result is found, return LyricResult::None
-        let Some(result) = result else {
+            .find(|result| !result.artist_names.contains("Genius"))
+        else {
             return Ok(LyricResult::None);
         };
 
         // Retrieve the song lyrics from the URL of the result
         let lyric = self.retrieve_lyric(&result.url).await?;
 
-        // Return a LyricResult::Some with the song information
         Ok(LyricResult::Some {
             track: result.title,
             artists: result.artist_names,
@@ -145,164 +198,378 @@ impl Default for Client {
     }
 }
 
+/// Only `https://genius.com/...` (or a subdomain of it) on the default port, no userinfo.
+fn is_allowed_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some_and(|host| {
+            host == ALLOWED_HOST
+                || host
+                    .strip_suffix(ALLOWED_HOST)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+}
+
+/// Read a response body, failing if it exceeds `limit` bytes.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        anyhow::ensure!(
+            usize::try_from(len).is_ok_and(|len| len <= limit),
+            "response body too large ({len} bytes, limit {limit})"
+        );
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            buf.len() + chunk.len() <= limit,
+            "response body exceeded {limit} bytes"
+        );
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Largest index `<= idx` that is a char boundary of `s`.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let mut idx = idx.min(s.len());
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// Returns `query` without `remaster` & `remix` information from track/artist query.
 /// Returned value is lowercase.
 /// These caused wildly invalid lyrics to be found.
 /// (try yourself adding remastered 2011 to a song's name when searching in Genius!)
+///
+/// Must never panic: `query` usually comes from track metadata, i.e. untrusted input.
 fn improve_query(query: &str) -> String {
     // flag for doing something wrong if the song name (after removing remix metadata) is too short.
     const SONG_MIN_LENGTH_WO_REMIX_METADATA: usize = 3;
 
-    let is_dash = |c: char| c == '-';
+    let is_filler = |c: char| c == '-' || c.is_whitespace();
 
-    // reverse finder for non-filler (space, dashes) chars before an index.
+    // Index just past the last non-filler (space, dash) char before `idx`.
     // Acts like a trim to remove undesired spaces and dashes.
-    let rfind_non_filler = |s: &str, idx: usize| {
-        let Some(s) = s.get(..idx) else { return idx };
-        s.char_indices()
-            .rfind(|(_, c)| !(is_dash(*c) || c.is_whitespace()))
-            .map_or(idx, |(idx, c)| idx + c.len_utf8())
+    let trim_filler_before = |s: &str, idx: usize| {
+        let idx = floor_char_boundary(s, idx);
+        s[..idx].trim_end_matches(is_filler).len()
     };
     // used to handle longer variants of words: `remixed`, `remastered`, etc.
     let end_of_word = |s: &str, idx: usize| {
-        let Some(s) = s.get(idx..) else { return idx };
-        s.find(|c: char| !c.is_alphanumeric())
-            .map_or(idx, |found| found + idx)
+        let idx = floor_char_boundary(s, idx);
+        s[idx..]
+            .find(|c: char| !c.is_alphanumeric())
+            .map_or(s.len(), |found| found + idx)
     };
 
     let mut query = query.to_lowercase();
+
     // remove "xxxx Remaster" from the query
     // For example, `{song} xxxx Remastered {artists}` becomes `{song} {artists}`.
     if let Some(remaster_start) = query.find("remaster") {
-        let end = remaster_start + "remaster".len();
-        let end = end_of_word(&query, end);
+        let end = end_of_word(&query, remaster_start + "remaster".len());
 
-        let mut start = remaster_start.saturating_sub(1);
-        let prev = query.get(..remaster_start.saturating_sub(2)).unwrap_or("");
-        let end_of_prev_word = prev.rfind(' ').unwrap_or(0);
+        // If the word right before "remaster" is a year (e.g. "2011 remastered"), drop it too.
+        let before = query[..remaster_start].trim_end_matches(is_filler);
+        let prev_word_start = before
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let prev_word = &before[prev_word_start..];
+        let start = if !prev_word.is_empty() && prev_word.chars().all(char::is_numeric) {
+            prev_word_start
+        } else {
+            before.len()
+        };
 
-        if let Some(year) = query.get(end_of_prev_word + 1..remaster_start.saturating_sub(1)) {
-            if year.chars().all(|c| c.is_whitespace() || c.is_numeric()) {
-                start = end_of_prev_word;
-            }
-        }
-        start = rfind_non_filler(&query, start);
+        let start = trim_filler_before(&query, start);
         query.drain(start..end);
     }
+
     // remove "- xxxx yyy remix" from the query
     // For example, `{song} - xxxx yyy remix {artists}` becomes `{song} {artists}`.
     if let Some(remix_start) = query.find("remix") {
-        let end = remix_start + "remix".len();
-        let end = end_of_word(&query, end);
+        let end = end_of_word(&query, remix_start + "remix".len());
 
-        if let Some(metadata_start) = query.rfind(is_dash) {
-            if metadata_start >= SONG_MIN_LENGTH_WO_REMIX_METADATA {
-                let start = rfind_non_filler(&query, metadata_start);
-                query.drain(start..end);
-            }
+        // Only a dash *before* "remix" introduces the remix metadata.
+        if let Some(metadata_start) = query[..remix_start].rfind('-')
+            && metadata_start >= SONG_MIN_LENGTH_WO_REMIX_METADATA
+        {
+            let start = trim_filler_before(&query, metadata_start);
+            query.drain(start..end);
         }
     }
+
     query
 }
 
 mod parse {
-    use html5ever::tendril::TendrilSink;
-    use html5ever::{expanded_name, local_name, namespace_url, ns, parse_document, ParseOpts};
-    use markup5ever_rcdom::{Handle, NodeData, RcDom};
+    use ego_tree::iter::Edge;
+    use scraper::{ElementRef, Html, Node, Selector};
 
     const LYRIC_CONTAINER_ATTR: &str = "data-lyrics-container";
+    /// Genius marks non-lyric chrome nested inside lyric containers
+    /// (contributor counts, "Lyrics" headers, ...) with this attribute.
+    const EXCLUDE_ATTR: &str = "data-exclude-from-selection";
 
     /// Parse the HTML content of a "genius.com" lyric page to retrieve the corresponding lyric.
-    pub fn parse(html: &str) -> anyhow::Result<String> {
-        // parse HTML content into DOM node(s)
-        let dom = parse_document(RcDom::default(), ParseOpts::default())
-            .from_utf8()
-            .read_from(&mut (html.as_bytes()))?;
+    pub fn parse(html: &str) -> String {
+        let document = Html::parse_document(html);
+        let selector = Selector::parse("[data-lyrics-container]")
+            .expect("static lyric container selector is valid");
 
-        let filter = |data: &NodeData| match data {
-            NodeData::Element { ref attrs, .. } => attrs
-                .borrow()
-                .iter()
-                .any(|attr| attr.name.local.to_string() == LYRIC_CONTAINER_ATTR),
-            _ => false,
-        };
-
-        Ok(parse_dom_node(&dom.document, Some(&filter), false))
-    }
-
-    /// Parse a dom node and extract the text of children nodes satisfying a requirement.
-    ///
-    /// The requirement is represented by a `filter` function and a `should_parse` variable.
-    /// Once a node satisfies a requirement, its children should also satisfy it.
-    fn parse_dom_node<F>(node: &Handle, filter: Option<&F>, mut should_parse: bool) -> String
-    where
-        F: Fn(&NodeData) -> bool,
-    {
-        log::debug!("parse dom node: node={node:?}, should_parse={should_parse}");
-
-        let mut s = String::new();
-
-        if !should_parse {
-            if let Some(f) = filter {
-                should_parse = f(&node.data);
+        let mut lyric = String::new();
+        for container in document.select(&selector) {
+            // A container nested in another container is already covered by its ancestor.
+            let nested = container
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .any(|el| el.value().attr(LYRIC_CONTAINER_ATTR).is_some());
+            if !nested {
+                extract_text(container, &mut lyric);
             }
         }
+        lyric
+    }
 
-        match &node.data {
-            NodeData::Text { contents } => {
-                if should_parse {
-                    s.push_str(&contents.borrow().to_string());
-                }
-            }
-            NodeData::Element { ref name, .. } => {
-                if let expanded_name!(html "br") = name.expanded() {
-                    if should_parse {
-                        s.push('\n');
+    /// Append the text of `container` to `out`, turning `<br>` into newlines and skipping
+    /// excluded subtrees. Iterative, so deeply nested markup cannot overflow the stack.
+    fn extract_text(container: ElementRef<'_>, out: &mut String) {
+        let mut skip_depth = 0usize;
+        for edge in container.traverse() {
+            match edge {
+                Edge::Open(node) => match node.value() {
+                    Node::Element(_) if skip_depth > 0 => skip_depth += 1,
+                    _ if skip_depth > 0 => {}
+                    Node::Element(el) if el.attr(EXCLUDE_ATTR) == Some("true") => skip_depth = 1,
+                    Node::Element(el) if el.name() == "br" => out.push('\n'),
+                    Node::Text(text) => out.push_str(&text.text),
+                    _ => {}
+                },
+                Edge::Close(node) => {
+                    if skip_depth > 0 && node.value().is_element() {
+                        skip_depth -= 1;
                     }
                 }
             }
-            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse;
+
+        #[test]
+        fn extracts_text_and_line_breaks() {
+            let html = r#"<html><body>
+                <div data-lyrics-container="true">[Verse 1]<br>Line one<br><i>Line</i> two</div>
+                <div data-lyrics-container="true"><br>[Chorus]<br>Hook</div>
+            </body></html>"#;
+            assert_eq!(parse(html), "[Verse 1]\nLine one\nLine two\n[Chorus]\nHook");
         }
 
-        node.children.borrow().iter().for_each(|node| {
-            s.push_str(&parse_dom_node(node, filter, should_parse));
-        });
+        #[test]
+        fn ignores_text_outside_containers() {
+            let html =
+                r#"<p>Ad text</p><div data-lyrics-container="true">Lyric</div><p>Footer</p>"#;
+            assert_eq!(parse(html), "Lyric");
+        }
 
-        s
+        #[test]
+        fn skips_excluded_header() {
+            let html = r#"<div data-lyrics-container="true"><div data-exclude-from-selection="true"><span>12 Contributors</span><h2>Song Lyrics</h2></div>[Intro]<br>Hello</div>"#;
+            assert_eq!(parse(html), "[Intro]\nHello");
+        }
+
+        #[test]
+        fn nested_containers_are_not_duplicated() {
+            let html = r#"<div data-lyrics-container="true">a<div data-lyrics-container="true">b</div>c</div>"#;
+            assert_eq!(parse(html), "abc");
+        }
+
+        #[test]
+        fn deeply_nested_markup_does_not_overflow() {
+            let depth = 50_000;
+            let html = format!(
+                "<div data-lyrics-container=\"true\">{}deep{}</div>",
+                "<span>".repeat(depth),
+                "</span>".repeat(depth)
+            );
+            assert_eq!(parse(&html), "deep");
+        }
+
+        #[test]
+        fn no_container_yields_empty() {
+            assert_eq!(parse("<html><body>nothing</body></html>"), "");
+        }
     }
 }
 
-mod search {
+pub mod search {
     use serde::Deserialize;
 
     #[derive(Debug, Deserialize)]
-    pub struct Body {
+    pub(crate) struct Body {
         pub meta: Metadata,
         pub response: Option<Response>,
     }
 
     #[derive(Debug, Deserialize)]
-    pub struct Metadata {
+    pub(crate) struct Metadata {
         pub status: u16,
         pub message: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
-    pub struct Response {
+    pub(crate) struct Response {
         pub hits: Vec<Hit>,
     }
 
     #[derive(Debug, Deserialize)]
-    pub struct Hit {
+    pub(crate) struct Hit {
         #[serde(rename(deserialize = "type"))]
         pub ty: String,
         pub result: Result,
     }
 
-    #[derive(Debug, Deserialize)]
+    /// A song hit from the Genius search API.
+    #[derive(Debug, Clone, Deserialize)]
     pub struct Result {
         pub url: String,
         pub title: String,
         pub artist_names: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Client, improve_query, is_allowed_url, search};
+
+    #[test]
+    fn improve_query_strips_remaster_with_year() {
+        assert_eq!(
+            improve_query("Here Comes The Sun - 2019 Remastered The Beatles"),
+            "here comes the sun the beatles"
+        );
+        assert_eq!(
+            improve_query("Song - Remastered 2009 Artist"),
+            "song 2009 artist"
+        );
+        assert_eq!(improve_query("2011 Remaster"), "");
+    }
+
+    #[test]
+    fn improve_query_strips_remix_metadata() {
+        assert_eq!(
+            improve_query("Song Name - Some DJ Remix Artist"),
+            "song name artist"
+        );
+        assert_eq!(improve_query("Song - Extended Remixed"), "song");
+        // Dash too early: the "song" would be empty, leave it alone.
+        assert_eq!(improve_query("A - remix"), "a - remix");
+    }
+
+    #[test]
+    fn improve_query_leaves_plain_queries() {
+        assert_eq!(
+            improve_query("Shape of You Ed Sheeran"),
+            "shape of you ed sheeran"
+        );
+    }
+
+    #[test]
+    fn improve_query_never_panics_on_unicode_or_odd_input() {
+        // Each of these panicked (non-char-boundary or start > end drain) before the fix.
+        assert_eq!(improve_query("songéremaster"), "songé");
+        assert_eq!(improve_query("abc remix foo - bar"), "abc remix foo - bar");
+
+        let pieces = [
+            "",
+            " ",
+            "-",
+            " - ",
+            "é",
+            "日本",
+            "🎵",
+            "\u{3000}",
+            "remaster",
+            "remastered",
+            "remix",
+            "remixes",
+            "2011",
+            "١٢",
+            "song",
+            "x",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    for d in pieces {
+                        let _ = improve_query(&format!("{a}{b}{c}{d}"));
+                        let _ = improve_query(&format!("{a} {b}-{c} {d}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn process_lyric_normalizes_section_spacing() {
+        assert_eq!(
+            Client::process_lyric("[Verse]\na\n[Chorus]\nb\n\n[Outro]\nc"),
+            "[Verse]\na\n\n[Chorus]\nb\n\n[Outro]\nc"
+        );
+    }
+
+    #[test]
+    fn only_genius_https_urls_are_allowed() {
+        let ok = |u: &str| is_allowed_url(&reqwest::Url::parse(u).unwrap());
+        assert!(ok("https://genius.com/Ed-sheeran-shape-of-you-lyrics"));
+        assert!(ok("https://www.genius.com/foo"));
+        assert!(!ok("http://genius.com/foo"));
+        assert!(!ok("https://genius.com.evil.example/foo"));
+        assert!(!ok("https://evilgenius.com/foo"));
+        assert!(!ok("https://genius.com:8443/foo"));
+        assert!(!ok("https://user@genius.com/foo"));
+        assert!(!ok("https://169.254.169.254/latest/meta-data"));
+        assert!(!ok("file:///etc/passwd"));
+    }
+
+    #[tokio::test]
+    async fn retrieve_lyric_rejects_foreign_urls_without_fetching() {
+        let client = Client::new();
+        for url in [
+            "http://127.0.0.1:1/",
+            "https://169.254.169.254/latest/meta-data",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(client.retrieve_lyric(url).await.is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn search_body_deserializes() {
+        let json = r#"{
+            "meta": {"status": 200},
+            "response": {"hits": [
+                {"type": "song", "result": {"url": "https://genius.com/a", "title": "A", "artist_names": "X"}},
+                {"type": "album", "result": {"url": "https://genius.com/b", "title": "B", "artist_names": "Y"}}
+            ]}
+        }"#;
+        let body: search::Body = serde_json::from_str(json).unwrap();
+        assert_eq!(body.meta.status, 200);
+        let hits = body.response.unwrap().hits;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].ty, "song");
+        assert_eq!(hits[0].result.title, "A");
     }
 }

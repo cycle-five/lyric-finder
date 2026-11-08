@@ -72,15 +72,7 @@ impl Client {
             .https_only(true)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    attempt.error("too many redirects")
-                } else if is_allowed_url(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
+            .redirect(redirect_policy())
             .build()
             .expect("failed to build HTTP client (TLS backend initialization failed)");
         Self { http }
@@ -147,13 +139,27 @@ impl Client {
             "refusing to fetch lyric from non-genius.com URL: {url}"
         );
 
-        let response = self.http.get(parsed).send().await?.error_for_status()?;
+        let lyric = self.fetch_lyric_page(parsed).await?;
+        Ok(lyric.trim().to_string())
+    }
+
+    /// Fetch and parse a lyric page. Callers must have validated `url` already.
+    ///
+    /// Anything but a 2xx is an error. This matters for 3xx: a redirect the policy refuses to
+    /// follow, or any redirect at all from a caller-supplied client with `Policy::none()`, comes
+    /// back as an `Ok` response that `error_for_status()` accepts, and would otherwise be parsed
+    /// into an empty lyric.
+    async fn fetch_lyric_page(&self, url: reqwest::Url) -> anyhow::Result<String> {
+        let response = self.http.get(url.clone()).send().await?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "lyric page request to {url} returned {status}"
+        );
         let bytes = read_body_capped(response, MAX_LYRIC_PAGE_BYTES).await?;
         let html = String::from_utf8_lossy(&bytes);
         log::trace!("retrieved lyric page from url={url} ({} bytes)", html.len());
-
-        let lyric = parse::parse(&html);
-        Ok(lyric.trim().to_string())
+        Ok(parse::parse(&html))
     }
 
     /// Process a lyric obtained by crawling the [Genius](https://genius.com) website.
@@ -196,6 +202,23 @@ impl Default for Client {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Follow redirects only to allowed URLs, at most [`MAX_REDIRECTS`] times.
+///
+/// A redirect anywhere else is an error rather than `attempt.stop()`: stopping hands the 3xx
+/// back to the caller as a successful response.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else if is_allowed_url(attempt.url()) {
+            attempt.follow()
+        } else {
+            let msg = format!("blocked redirect to non-genius.com URL: {}", attempt.url());
+            attempt.error(msg)
+        }
+    })
 }
 
 /// Only `https://genius.com/...` (or a subdomain of it) on the default port, no userinfo.
@@ -451,7 +474,71 @@ pub mod search {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, improve_query, is_allowed_url, search};
+    use super::{Client, improve_query, is_allowed_url, redirect_policy, search};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve `response` verbatim to each of up to `max_conns` connections on a local port.
+    fn serve(response: String, max_conns: usize) -> reqwest::Url {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(max_conns) {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        reqwest::Url::parse(&format!("http://{addr}/lyrics")).unwrap()
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_errors_on_blocked_redirect() {
+        // Plain-HTTP local server, so build a client with the same policy minus https_only.
+        let http = reqwest::Client::builder()
+            .redirect(redirect_policy())
+            .build()
+            .unwrap();
+        let url = serve(redirect_to("https://evil.example/x"), 1);
+        let err = http.get(url).send().await.unwrap_err();
+        assert!(err.is_redirect(), "{err:?}");
+        assert!(format!("{err:?}").contains("blocked redirect"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn lyric_fetch_rejects_unfollowed_3xx() {
+        // A caller-supplied client that never follows redirects hands back the raw 302.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let client = Client::from_http_client(&http);
+        let url = serve(redirect_to("https://genius.com/elsewhere"), 1);
+        let err = client.fetch_lyric_page(url).await.unwrap_err();
+        assert!(err.to_string().contains("302"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn lyric_fetch_parses_2xx() {
+        let http = reqwest::Client::new();
+        let client = Client::from_http_client(&http);
+        let body = r#"<div data-lyrics-container="true">a<br>b</div>"#;
+        let url = serve(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            1,
+        );
+        assert_eq!(client.fetch_lyric_page(url).await.unwrap(), "a\nb");
+    }
 
     #[test]
     fn improve_query_strips_remaster_with_year() {

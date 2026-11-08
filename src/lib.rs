@@ -105,7 +105,10 @@ impl Client {
         let body: search::Body = match serde_json::from_slice(&bytes) {
             Ok(body) => body,
             Err(err) if !status.is_success() => {
-                anyhow::bail!("search request failed with status code: {status} ({err})")
+                anyhow::bail!(
+                    "Genius search request failed with status code: {status}{} ({err})",
+                    challenge_hint(&bytes)
+                )
             }
             Err(err) => return Err(err.into()),
         };
@@ -152,10 +155,15 @@ impl Client {
     async fn fetch_lyric_page(&self, url: reqwest::Url) -> anyhow::Result<String> {
         let response = self.http.get(url.clone()).send().await?;
         let status = response.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "lyric page request to {url} returned {status}"
-        );
+        if !status.is_success() {
+            let body = read_body_capped(response, MAX_LYRIC_PAGE_BYTES)
+                .await
+                .unwrap_or_default();
+            anyhow::bail!(
+                "lyric page request to {url} returned {status}{}",
+                challenge_hint(&body)
+            );
+        }
         let bytes = read_body_capped(response, MAX_LYRIC_PAGE_BYTES).await?;
         let html = String::from_utf8_lossy(&bytes);
         log::trace!("retrieved lyric page from url={url} ({} bytes)", html.len());
@@ -233,6 +241,18 @@ fn is_allowed_url(url: &reqwest::Url) -> bool {
                     .strip_suffix(ALLOWED_HOST)
                     .is_some_and(|prefix| prefix.ends_with('.'))
         })
+}
+
+/// Genius serves a "make sure you're a human" page (HTTP 403) to clients its bot protection
+/// rejects. Name that in errors so callers can tell it apart from other failures.
+fn challenge_hint(body: &[u8]) -> &'static str {
+    const MARKER: &str = "make sure you're a human";
+    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]);
+    if text.contains(MARKER) {
+        " (blocked by Genius bot protection: human-verification page)"
+    } else {
+        ""
+    }
 }
 
 /// Read a response body, failing if it exceeds `limit` bytes.
@@ -523,6 +543,24 @@ mod tests {
         let url = serve(redirect_to("https://genius.com/elsewhere"), 1);
         let err = client.fetch_lyric_page(url).await.unwrap_err();
         assert!(err.to_string().contains("302"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn lyric_fetch_names_bot_challenge() {
+        let client = Client::from_http_client(&reqwest::Client::new());
+        let body = r#"<div class="line2">Sorry, we have to make sure you're a human before we can show you this page</div>"#;
+        let url = serve(
+            format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            1,
+        );
+        let err = client.fetch_lyric_page(url).await.unwrap_err().to_string();
+        assert!(
+            err.contains("403") && err.contains("bot protection"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

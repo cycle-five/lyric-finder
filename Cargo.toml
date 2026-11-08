@@ -4,14 +4,14 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "A lyric finder library"
+description = "Find song lyrics via the LRCLIB open lyrics database"
 authors = [
   "Thang Pham <phamducthang1234@gmail.com>",
   "Cycle Five <cycle.five@proton.me>",
 ]
 repository = "https://github.com/cycle-five/lyric-finder"
 readme = "README.md"
-keywords = ["lyric", "lyrics", "song", "track", "genius"]
+keywords = ["lyric", "lyrics", "song", "lrclib", "lrc"]
 categories = ["api-bindings", "multimedia::audio"]
 
 [features]
@@ -22,12 +22,10 @@ native-tls = ["reqwest/native-tls"]
 rustls-tls = ["rustls"]
 
 [dependencies]
-reqwest = { version = "0.13", features = ["json", "query", "http2", "charset"], default-features = false }
+reqwest = { version = "0.13", features = ["query", "http2", "charset"], default-features = false }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-scraper = { version = "0.29", default-features = false }
-ego-tree = "0.11"
 log = "0.4"
 
 [dev-dependencies]
